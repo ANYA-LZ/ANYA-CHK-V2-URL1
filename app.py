@@ -208,28 +208,8 @@ def index():
         exp_month = request.form['exp_month']
         exp_year = request.form['exp_year']
         cvv = request.form['cvv']
-        cookies_raw = request.form['cookies']
+        cookies = request.form['cookies']
         accessToken = request.form['accessToken']
-
-        try:
-            # Try to parse the cookies as JSON
-            cookies = json.loads(cookies_raw)
-            if not isinstance(cookies, dict):
-                raise ValueError("Cookies should be a dictionary.")
-        except json.JSONDecodeError:
-            # If JSON decoding fails, check if it's a string with 'key=value' format
-            cookies_dict = {}
-            cookie_pairs = cookies_raw.split(';')
-            for pair in cookie_pairs:
-                try:
-                    key, value = pair.split('=', 1)
-                    cookies_dict[key.strip()] = value.strip()
-                except ValueError:
-                    continue  # If splitting fails, skip the invalid pair
-            
-            if not cookies_dict:
-                return render_template('result.html', status="ERROR", response="Invalid cookies format")
-            cookies = cookies_dict
 
         status, response = parse_response(card_number, exp_month, exp_year, cvv, cookies, accessToken)
         return render_template('result.html', status=status, response=response)
