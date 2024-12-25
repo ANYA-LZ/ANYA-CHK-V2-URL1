@@ -170,7 +170,7 @@ def process_payment(card_number, exp_month, exp_year, cvv, cookies, accessToken)
 
         nonce = get_nonce(cookies, random_person)
         if not nonce:
-            return "ERROR: FAILED TO FETCH NONCE"
+            return f"ERROR: FAILED TO FETCH NONCE {cookies}"
 
         token = get_token(card_number, exp_month, exp_year, cvv, random_person, accessToken)
         if not token:
