@@ -23,6 +23,25 @@ def fetch_city_zipcode_data():
     except requests.exceptions.RequestException as e:
         print(f"ERROR: FAILED TO FETCH CITY ZIPCODE DATA {e}")
         return False
+    
+# Load the data from the GitHub file
+def load_data_from_github(token):
+    url = "https://raw.githubusercontent.com/ANYA-LZ/anya-settings/refs/heads/main/gateways_map.json"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            try:
+                return response.json()
+            except ValueError:
+                print("Failed to parse JSON from the response.")
+                return False
+        else:
+            print(f"Failed to load data from GitHub, status code: {response.status_code}, {response.text}")
+            return False
+    except requests.RequestException as e:
+        print(f"An error occurred while fetching the data: {e}")
+        return False
 
 def generate_random_person():
     city_zipcode_data = fetch_city_zipcode_data()
@@ -162,21 +181,34 @@ def check_card(token, random_person, cookies, nonce, accessToken):
         print(f"Failed to check card: {e}")
         return False
 
-def process_payment(card_number, exp_month, exp_year, cvv, cookies, accessToken):
+def process_payment(card_number, exp_month, exp_year, cvv, cookies_path, accessToken):
     try:
+        cookies_path_parts = cookies_path.split("|")
+        if len(cookies_path_parts) != 5:
+            return "ERROR: FAILED TO FETCH COOKIES PARTS"
+        
+        gateway, version, url, cookie_key, token = cookies_path_parts
+
+        data = load_data_from_github(token)
+        if not data:
+            return "ERROR: FAILED TO LOAD DATA FROM GITHUB"
+
+        selected_cookies = data[gateway][version][url]["cookies"].get(cookie_key, [])
+        formatted_cookies = {cookie['name']: cookie['value'] for cookie in selected_cookies}
+
         random_person = generate_random_person()
         if not random_person:
             return "ERROR: FAILED TO FETCH CITY ZIPCODE DATA"
 
-        nonce = get_nonce(cookies, random_person)
+        nonce = get_nonce(formatted_cookies, random_person)
         if not nonce:
-            return f"ERROR: FAILED TO FETCH NONCE {cookies}"
+            return f"ERROR: FAILED TO FETCH NONCE {formatted_cookies}"
 
         token = get_token(card_number, exp_month, exp_year, cvv, random_person, accessToken)
         if not token:
             return "ERROR: FAILED TO GET TOKEN"
 
-        response = check_card(token, random_person, cookies, nonce, accessToken)
+        response = check_card(token, random_person, formatted_cookies, nonce, accessToken)
         return response
     except Exception as e:
         print(f"An error occurred: {e}")
@@ -208,12 +240,10 @@ def index():
         exp_month = request.form['exp_month']
         exp_year = request.form['exp_year']
         cvv = request.form['cvv']
-        cookies_str = request.form['cookies']
+        cookies_path = request.form['cookies']
         accessToken = request.form['accessToken']
 
-        cookies = json.loads(cookies_str)
-
-        status, response = parse_response(card_number, exp_month, exp_year, cvv, cookies, accessToken)
+        status, response = parse_response(card_number, exp_month, exp_year, cvv, cookies_path, accessToken)
         return render_template('result.html', status=status, response=response)
 
     return render_template('index.html')
