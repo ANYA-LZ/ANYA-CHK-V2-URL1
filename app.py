@@ -208,8 +208,10 @@ def index():
         exp_month = request.form['exp_month']
         exp_year = request.form['exp_year']
         cvv = request.form['cvv']
-        cookies = request.form['cookies']
+        cookies_str = request.form['cookies']
         accessToken = request.form['accessToken']
+
+        cookies = json.loads(cookies_str)
 
         status, response = parse_response(card_number, exp_month, exp_year, cvv, cookies, accessToken)
         return render_template('result.html', status=status, response=response)
