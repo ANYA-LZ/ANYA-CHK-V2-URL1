@@ -189,22 +189,25 @@ def check_card(token, random_person, cookies, nonce, accessToken):
 
 def process_payment(card_number, exp_month, exp_year, cvv, cookies_path, accessToken):
     try:
-
+        # Split cookies_path and validate the format
         cookies_path_parts = cookies_path.split("|")
         if len(cookies_path_parts) != 5:
             return "ERROR: FAILED TO FETCH COOKIES PARTS"
         
         gateway, version, url, cookie_key, token = cookies_path_parts
 
+        # Load data from GitHub
         data = load_data_from_github(token)
         if not data:
             return "ERROR: FAILED TO LOAD DATA FROM GITHUB"
 
+        # Replace single quotes with double quotes in string values
+        data = {key: value.replace("'", '"') if isinstance(value, str) else value for key, value in data.items()}
+
         try:
+            # Extract selected cookies
             selected_cookies = data[gateway][version][url]["cookies"].get(cookie_key, [])
             formatted_cookies = {cookie['name']: cookie['value'] for cookie in selected_cookies}
-
-            json.dumps(formatted_cookies)
         except KeyError:
             return "ERROR: INVALID KEYS IN DATA"
         except json.JSONDecodeError:
@@ -212,18 +215,22 @@ def process_payment(card_number, exp_month, exp_year, cvv, cookies_path, accessT
         except Exception as e:
             return f"ERROR: {str(e)}"
 
+        # Generate random person data
         random_person = generate_random_person()
         if not random_person:
             return "ERROR: FAILED TO FETCH CITY ZIPCODE DATA"
 
+        # Get nonce for payment
         nonce = get_nonce(formatted_cookies, random_person)
         if not nonce:
             return f"ERROR: FAILED TO FETCH NONCE {formatted_cookies}"
 
+        # Get token for the card payment
         token = get_token(card_number, exp_month, exp_year, cvv, random_person, accessToken)
         if not token:
             return "ERROR: FAILED TO GET TOKEN"
 
+        # Check the card validity
         response = check_card(token, random_person, formatted_cookies, nonce, accessToken)
         return response
 
