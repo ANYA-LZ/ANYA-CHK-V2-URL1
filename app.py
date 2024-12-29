@@ -86,10 +86,16 @@ def get_nonce(cookies, random_person):
     }
 
     try:
-        response = requests.post(url, params=params, cookies=cookies, headers=headers).content
+        with requests.Session() as session:
+            session.headers.update(headers)
+            response = session.post(url, params=params, cookies=cookies, timeout=10).content
+            
         tree = html.fromstring(response)
         nonce_value = tree.xpath('//input[@id="woocommerce-add-payment-method-nonce"]/@value')
         return nonce_value[0] if nonce_value else None
+    except requests.Timeout:
+        print(f"Timeout occurred while fetching nonce for {url}")
+        return False
     except Exception as e:
         print(f"Failed to fetch nonce: {e}")
         return False
