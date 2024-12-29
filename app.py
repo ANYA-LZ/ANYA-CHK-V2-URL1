@@ -183,6 +183,7 @@ def check_card(token, random_person, cookies, nonce, accessToken):
 
 def process_payment(card_number, exp_month, exp_year, cvv, cookies_path, accessToken):
     try:
+
         cookies_path_parts = cookies_path.split("|")
         if len(cookies_path_parts) != 5:
             return "ERROR: FAILED TO FETCH COOKIES PARTS"
@@ -193,8 +194,17 @@ def process_payment(card_number, exp_month, exp_year, cvv, cookies_path, accessT
         if not data:
             return "ERROR: FAILED TO LOAD DATA FROM GITHUB"
 
-        selected_cookies = data[gateway][version][url]["cookies"].get(cookie_key, [])
-        formatted_cookies = {cookie['name']: cookie['value'] for cookie in selected_cookies}
+        try:
+            selected_cookies = data[gateway][version][url]["cookies"].get(cookie_key, [])
+            formatted_cookies = {cookie['name']: cookie['value'] for cookie in selected_cookies}
+
+            json.dumps(formatted_cookies)
+        except KeyError:
+            return "ERROR: INVALID KEYS IN DATA"
+        except json.JSONDecodeError:
+            return "ERROR: COOKIES FORMAT IS NOT VALID JSON"
+        except Exception as e:
+            return f"ERROR: {str(e)}"
 
         random_person = generate_random_person()
         if not random_person:
@@ -210,6 +220,7 @@ def process_payment(card_number, exp_month, exp_year, cvv, cookies_path, accessT
 
         response = check_card(token, random_person, formatted_cookies, nonce, accessToken)
         return response
+
     except Exception as e:
         print(f"An error occurred: {e}")
         return "ERROR: Unknown"
