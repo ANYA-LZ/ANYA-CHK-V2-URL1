@@ -9,15 +9,17 @@ def handle_payment():
 
         data = request.get_json()
         
-        print("Received payment request:")
-        print("Gateway Data:", json.dumps(data.get('gateway_config'), indent=2))
-        print("Card Info:", json.dumps(data.get('card'), indent=2))
-        
+        card = json.dumps(data.get('card'), indent=2)
+        gateway_config = json.dumps(data.get('gateway_config'), indent=2)
+
+        card_number = card["number"]
+        cookies = gateway_config["cookies"]
         
         return jsonify({
             "status": "success",
             "message": "Payment processed successfully",
-            "received_data": data
+            "card": card_number,
+            "cookies": cookies
         }), 200
         
     except Exception as e:
