@@ -3,7 +3,7 @@ import json
 
 app = Flask(__name__)
 
-@app.route('/', methods=['POST'])
+@app.route('/payment', methods=['POST'])
 def handle_payment():
     try:
 
