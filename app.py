@@ -8,6 +8,10 @@ from lxml import html
 
 app = Flask(__name__)
 
+@app.route('/')
+def index():
+    return "hi"
+
 fake = Faker("en_US")
 domains = ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com"]
 
