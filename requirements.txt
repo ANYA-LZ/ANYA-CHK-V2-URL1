@@ -1,5 +1,7 @@
 Flask
 requests
-Faker
+urllib3
 lxml
+Faker
+cloudscraper
 gunicorn
