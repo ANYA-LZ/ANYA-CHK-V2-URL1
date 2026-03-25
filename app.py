@@ -1,6 +1,6 @@
 """
 Payment Gateway Flask Server – V5.0.0
-Handles Stripe Auth, Stripe Charge, Braintree Auth payment processing
+Handles Stripe Auth, Stripe Charge, Braintree Auth, Adyen Charge payment processing
 with per-request session isolation, proxy support, and cloudscraper bypass.
 """
 
@@ -8,21 +8,26 @@ import re
 import json
 import time
 import uuid
+import os
 import random
 import logging
 import threading
 from datetime import datetime, timedelta
-from functools import wraps
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
+import base64
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from flask import Flask, request, jsonify
 from lxml import html
 from faker import Faker
 import cloudscraper
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.backends import default_backend
 
 # ═══════════════════════════════════════════════════════
 #  App & Logging
@@ -371,6 +376,12 @@ def _create_gateway_session(gateway_config: Dict, random_person: Dict) -> reques
         "Referer": gateway_config["url"],
     })
 
+    # Self-contained gateways manage their own sessions; skip warmup
+    # to avoid consuming their cookies with a useless pre-request.
+    if "Adyen Charge" in gateway_config.get("gateway_type", ""):
+        _apply_cookies(session, gateway_config)
+        return session
+
     # Warm-up request to collect server cookies
     try:
         resp = session.get(origin, timeout=REQUEST_TIMEOUT)
@@ -529,6 +540,744 @@ def get_stripe_auth_id(
         return False
     finally:
         api_session.close()
+
+
+# ═══════════════════════════════════════════════════════
+#  Stripe Auth v3 – Login Session Cache (5-hour TTL)
+# ═══════════════════════════════════════════════════════
+
+_LOGIN_CACHE_TTL = timedelta(hours=5)
+_login_cache: Dict[str, Dict[str, Any]] = {}
+_login_cache_lock = threading.Lock()
+
+
+def _get_cached_login(login_email: str) -> Optional[Dict[str, Any]]:
+    """Return cached login data if still valid, else None."""
+    with _login_cache_lock:
+        entry = _login_cache.get(login_email)
+        if not entry:
+            return None
+        if datetime.now() - entry["ts"] > _LOGIN_CACHE_TTL:
+            _login_cache.pop(login_email, None)
+            logger.info(f"Login cache expired for {login_email}")
+            return None
+        logger.info(f"Login cache hit for {login_email}")
+        return entry
+
+
+def _set_cached_login(
+    login_email: str,
+    cookies: Dict[str, str],
+    pk_live: str,
+    origin: str,
+    billing_url: str,
+) -> None:
+    """Store login session data in cache."""
+    with _login_cache_lock:
+        _login_cache[login_email] = {
+            "cookies": cookies,
+            "pk_live": pk_live,
+            "origin": origin,
+            "billing_url": billing_url,
+            "ts": datetime.now(),
+        }
+    logger.info(f"Login session cached for {login_email}")
+
+
+def _invalidate_cached_login(login_email: str) -> None:
+    """Remove a login entry from cache."""
+    with _login_cache_lock:
+        _login_cache.pop(login_email, None)
+    logger.info(f"Login cache invalidated for {login_email}")
+
+
+# ═══════════════════════════════════════════════════════
+#  Stripe Auth v3 – Login-based flow (ProWritingAid)
+# ═══════════════════════════════════════════════════════
+
+def _stripe_auth_login_flow(
+    card_info: Dict,
+    random_person: Dict,
+    gateway_config: Dict,
+) -> Tuple[str, str]:
+    """Full Stripe Auth v3_with_login pipeline with login session caching.
+
+    Cached per login_email for 5 hours:
+        - Authenticated cookies, pk_live, origin, billing_url
+    Fresh per card check:
+        - verification_token (from billing page)
+        - client_secret / seti_id (from StripeIntentForAddingCard)
+        - confirm payload with card data
+    """
+    login_data = gateway_config.get("login")
+    if not login_data:
+        return ERROR, "Login credentials missing in gateway config"
+
+    login_email = login_data.get("email")
+    login_password = login_data.get("password")
+    if not login_email or not login_password:
+        return ERROR, "Login email or password missing"
+
+    site_url = gateway_config["url"]
+    parsed = urlparse(site_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    billing_url = site_url
+
+    proxies = _proxy_dict(gateway_config)
+
+    # ── Helper: build a fresh HTTP session ──
+    def _build_login_session():
+        if gateway_config.get("bypass_cloudscraper", False):
+            s = cloudscraper.create_scraper()
+        else:
+            s = requests.Session()
+            adapter = HTTPAdapter(pool_maxsize=5)
+            s.mount("https://", adapter)
+            s.mount("http://", adapter)
+        if proxies:
+            s.proxies = proxies
+        s.headers.update({
+            "User-Agent": random_person["user_agent"],
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        })
+        return s
+
+    session = _build_login_session()
+
+    try:
+        cached = _get_cached_login(login_email)
+        pk_live = None
+        verification_token = None
+        used_cache = False
+
+        # ══════════════════════════════════════════════
+        #  Try to reuse cached login session
+        # ══════════════════════════════════════════════
+        if cached:
+            # Restore cached cookies into the new session
+            for name, value in cached["cookies"].items():
+                session.cookies.set(name, value)
+            pk_live = cached["pk_live"]
+
+            # Load billing page to get a fresh verification_token
+            billing_resp = session.get(billing_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            billing_resp.raise_for_status()
+
+            # Check if redirected to login page (cookies expired)
+            if "/Account/Login" in billing_resp.url:
+                logger.info(f"Cached session expired for {login_email}, re-logging in")
+                _invalidate_cached_login(login_email)
+                cached = None
+                # Rebuild session without stale cookies
+                session.close()
+                session = _build_login_session()
+            else:
+                billing_tree = html.fromstring(billing_resp.content)
+                token_nodes = billing_tree.xpath('//input[@name="__RequestVerificationToken"]/@value')
+                if token_nodes:
+                    verification_token = token_nodes[0]
+                    used_cache = True
+                    logger.info(f"Reusing cached login for {login_email} – skipped login")
+                else:
+                    # Token extraction failed, invalidate and re-login
+                    _invalidate_cached_login(login_email)
+                    cached = None
+                    session.close()
+                    session = _build_login_session()
+
+        # ══════════════════════════════════════════════
+        #  Full login (only when no valid cache)
+        # ══════════════════════════════════════════════
+        if not used_cache:
+            # ── Step 1: GET billing URL → redirects to login page ──
+            resp = session.get(billing_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            resp.raise_for_status()
+
+            tree = html.fromstring(resp.content)
+
+            token_nodes = tree.xpath('//input[@name="__RequestVerificationToken"]/@value')
+            verification_token = token_nodes[0] if token_nodes else None
+            if not verification_token:
+                return ERROR, "Failed to extract verification token from login page"
+
+            # ── Step 2: POST login ──
+            login_url = f"{origin}/en/Account/Login3?returnUrl=/en/Payment/Billing?tab=methods"
+            login_payload = {
+                "ReturnUrl": "/en/Payment/Billing?tab=methods",
+                "__RequestVerificationToken": verification_token,
+                "UserName": login_email,
+                "Password": login_password,
+            }
+
+            session.headers.update({
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": origin,
+                "Referer": resp.url,
+            })
+
+            login_resp = session.post(
+                login_url, data=login_payload,
+                timeout=REQUEST_TIMEOUT, allow_redirects=True,
+            )
+            login_resp.raise_for_status()
+
+            if "/Account/Login" in login_resp.url:
+                return FAILED, "Login failed – invalid credentials"
+
+            # ── Step 3: Get billing page ──
+            if "Billing" not in login_resp.url:
+                billing_resp = session.get(billing_url, timeout=REQUEST_TIMEOUT)
+                billing_resp.raise_for_status()
+            else:
+                billing_resp = login_resp
+
+            billing_tree = html.fromstring(billing_resp.content)
+
+            # Extract pk_live
+            pk_nodes = billing_tree.xpath('//input[@name="StripePublicApiKey"]/@value')
+            if not pk_nodes:
+                pk_match = _RE_PK_LIVE_RAW.search(billing_resp.text)
+                pk_live = pk_match.group(0) if pk_match else None
+            else:
+                pk_live = pk_nodes[0]
+
+            if not pk_live:
+                return ERROR, "Failed to extract pk_live from billing page"
+
+            # Extract fresh verification_token
+            token_nodes = billing_tree.xpath('//input[@name="__RequestVerificationToken"]/@value')
+            if token_nodes:
+                verification_token = token_nodes[0]
+            else:
+                return ERROR, "Failed to extract verification token from billing page"
+
+            # ── Cache the login session for reuse ──
+            cookies_dict = {c.name: c.value for c in session.cookies}
+            _set_cached_login(login_email, cookies_dict, pk_live, origin, billing_url)
+
+        # ══════════════════════════════════════════════
+        #  Per-card steps (always fresh)
+        # ══════════════════════════════════════════════
+
+        # ── Step 4: POST StripeIntentForAddingCard → fresh client_secret ──
+        intent_url = f"{origin}/en/Payment/StripeIntentForAddingCard"
+        session.headers.update({
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": billing_url,
+            "__requestverificationtoken": verification_token,
+        })
+
+        intent_resp = session.post(intent_url, data="", timeout=REQUEST_TIMEOUT)
+        intent_resp.raise_for_status()
+
+        try:
+            intent_data = intent_resp.json()
+        except (json.JSONDecodeError, ValueError):
+            return ERROR, "Failed to parse SetupIntent response"
+
+        client_secret = intent_data.get("clientSecret")
+        if not client_secret:
+            return ERROR, "Failed to get SetupIntent client_secret"
+
+        # Extract seti_id from client_secret (seti_xxx_secret_xxx)
+        seti_id = client_secret.split("_secret_")[0] if "_secret_" in client_secret else None
+        if not seti_id:
+            return ERROR, "Failed to parse SetupIntent ID"
+
+        # ── Step 5: Confirm setup_intent via Stripe API ──
+        year_short = str(card_info["year"])[-2:]
+
+        stripe_headers = {
+            "User-Agent": random_person["user_agent"],
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://js.stripe.com",
+            "Referer": "https://js.stripe.com/",
+        }
+
+        confirm_payload = {
+            "payment_method_data[type]": "card",
+            "payment_method_data[card][number]": card_info["number"],
+            "payment_method_data[card][cvc]": card_info["cvv"],
+            "payment_method_data[card][exp_month]": card_info["month"],
+            "payment_method_data[card][exp_year]": year_short,
+            "payment_method_data[billing_details][address][country]": "US",
+            "payment_method_data[billing_details][address][postal_code]": random_person["zipcode"],
+            "payment_method_data[guid]": str(_fake.uuid4()),
+            "payment_method_data[muid]": str(_fake.uuid4()),
+            "payment_method_data[sid]": str(_fake.uuid4()),
+            "payment_method_data[pasted_fields]": "number",
+            "payment_method_data[payment_user_agent]": (
+                f"stripe.js/{random.randint(280000000, 290000000)}; "
+                f"stripe-js-v3/{random.randint(280000000, 290000000)}; payment-element"
+            ),
+            "payment_method_data[referrer]": f"{origin}/en/Payment/Billing?tab=methods",
+            "payment_method_data[time_on_page]": str(random.randint(120000, 240000)),
+            "expected_payment_method_type": "card",
+            "use_stripe_sdk": "true",
+            "key": pk_live,
+            "client_secret": client_secret,
+        }
+
+        confirm_url = f"https://api.stripe.com/v1/setup_intents/{seti_id}/confirm"
+
+        api_session = _build_api_session(proxies)
+        try:
+            confirm_resp = api_session.post(
+                confirm_url, data=confirm_payload,
+                headers=stripe_headers, timeout=REQUEST_TIMEOUT,
+            )
+        finally:
+            api_session.close()
+
+        try:
+            confirm_data = confirm_resp.json()
+        except (json.JSONDecodeError, ValueError):
+            return ERROR, "Failed to parse Stripe confirm response"
+
+        # ── Step 6: Interpret result ──
+        si_status = confirm_data.get("status")
+
+        if si_status == "succeeded":
+            pm_id = confirm_data.get("payment_method")
+            delete_msg = ""
+
+            if pm_id:
+                # Add payment method to site
+                try:
+                    add_url = f"{origin}/en/Payment/StripeAddPaymentMethod"
+                    session.headers.update({
+                        "Accept": "application/json, text/javascript, */*; q=0.01",
+                        "Content-Type": "application/json; charset=UTF-8",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "__requestverificationtoken": verification_token,
+                    })
+                    add_resp = session.post(
+                        add_url,
+                        data=json.dumps({"PaymentMethodId": pm_id}),
+                        timeout=REQUEST_TIMEOUT,
+                    )
+                    add_resp.raise_for_status()
+                except Exception as exc:
+                    logger.warning(f"StripeAddPaymentMethod failed: {exc}")
+
+                # Delete card: reload billing page to get numeric card ID + fresh token
+                try:
+                    del_billing = session.get(billing_url, timeout=REQUEST_TIMEOUT)
+                    del_billing.raise_for_status()
+                    del_tree = html.fromstring(del_billing.content)
+
+                    # Fresh anti-forgery token from reloaded page
+                    del_token_nodes = del_tree.xpath('//input[@name="__RequestVerificationToken"]/@value')
+                    del_token = del_token_nodes[0] if del_token_nodes else verification_token
+
+                    # Extract numeric card ID from DeleteURL or data-card-id
+                    card_id = None
+                    # Try DeleteURL in embedded JSON: "DeleteURL":"/en/Payment/DeleteCustomerCard?cardId=NNNN"
+                    m = re.search(r'DeleteCustomerCard\?cardId=(\d+)', del_billing.text)
+                    if m:
+                        card_id = m.group(1)
+                    else:
+                        # Try data-card-id attribute
+                        cid_nodes = del_tree.xpath('//*[@data-card-id]/@data-card-id')
+                        if cid_nodes:
+                            card_id = cid_nodes[0]
+
+                    if not card_id:
+                        logger.warning("Could not find numeric card ID on billing page")
+                        delete_msg = " (error delete)"
+                    else:
+                        del_url = f"{origin}/en/Payment/DeleteCustomerCard"
+                        session.headers.update({
+                            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                            "X-Requested-With": "XMLHttpRequest",
+                            "Accept": "*/*",
+                            "Referer": billing_url,
+                        })
+                        # Remove __requestverificationtoken from headers — token goes in body
+                        session.headers.pop("__requestverificationtoken", None)
+                        del_resp = session.post(
+                            del_url,
+                            data={"cardId": card_id, "__RequestVerificationToken": del_token},
+                            timeout=REQUEST_TIMEOUT,
+                        )
+                        del_resp.raise_for_status()
+                        delete_msg = ""
+                except Exception as exc:
+                    logger.warning(f"DeleteCustomerCard failed: {exc}")
+                    delete_msg = " (error delete)"
+
+            # Update cached cookies after successful flow
+            cookies_dict = {c.name: c.value for c in session.cookies}
+            _set_cached_login(login_email, cookies_dict, pk_live, origin, billing_url)
+
+            return SUCCESS, f"Approved{delete_msg}"
+
+        if si_status == "requires_action":
+            next_action = confirm_data.get("next_action", {})
+            action_type = next_action.get("type", "unknown")
+            return PASSAD, f"Challenge Required ({action_type})"
+
+        # Error case
+        error_obj = confirm_data.get("error", {})
+        if error_obj:
+            err_msg = error_obj.get("message", "Unknown error")
+            decline_code = error_obj.get("decline_code")
+            if decline_code:
+                if decline_code == "insufficient_funds":
+                    return INSUFFICIENT_FUNDS, "Insufficient Funds"
+                err_msg = f"{err_msg} ({decline_code.replace('_', ' ').title()})"
+            return FAILED, err_msg
+
+        return FAILED, f"Setup intent status: {si_status or 'unknown'}"
+
+    except requests.RequestException as exc:
+        is_pe, _ = is_proxy_error(exc)
+        if is_pe:
+            msg = categorize_proxy_error(exc)
+            logger.error(f"Proxy error in stripe_auth_login_flow: {msg}")
+            return ERROR, msg
+        logger.error(f"Request error in stripe_auth_login_flow: {exc}")
+        return ERROR, f"Request failed: {exc}"
+    except Exception as exc:
+        logger.error(f"Unexpected error in stripe_auth_login_flow: {exc}")
+        return ERROR, f"Processing failed: {exc}"
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════
+#  Adyen Charge – GOG Wallet Top-Up Flow
+# ═══════════════════════════════════════════════════════
+
+
+def _adyen_encrypt(field_name: str, value: str, adyen_public_key: str) -> str:
+    """Encrypt card data using Adyen CSE format (JWE)."""
+    exponent_hex, modulus_hex = adyen_public_key.split("|")
+    exponent = int(exponent_hex, 16)
+    modulus = int(modulus_hex, 16)
+
+    public_numbers = rsa.RSAPublicNumbers(exponent, modulus)
+    public_key = public_numbers.public_key(default_backend())
+
+    timestamp = str(int(time.time() * 1000))
+    plaintext = json.dumps({field_name: value, "generationtime": timestamp})
+    plaintext_bytes = plaintext.encode("utf-8")
+
+    aes_key = os.urandom(32)
+    nonce = os.urandom(12)
+
+    aesgcm = AESGCM(aes_key)
+    ciphertext = aesgcm.encrypt(nonce, plaintext_bytes, None)
+
+    encrypted_aes_key = public_key.encrypt(
+        aes_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+
+    header = {"alg": "RSA-OAEP-256", "enc": "A256GCM", "version": "1"}
+    header_b64 = base64.urlsafe_b64encode(json.dumps(header).encode()).rstrip(b"=").decode()
+    encrypted_key_b64 = base64.urlsafe_b64encode(encrypted_aes_key).rstrip(b"=").decode()
+    iv_b64 = base64.urlsafe_b64encode(nonce).rstrip(b"=").decode()
+
+    ct = ciphertext[:-16]
+    tag = ciphertext[-16:]
+    ct_b64 = base64.urlsafe_b64encode(ct).rstrip(b"=").decode()
+    tag_b64 = base64.urlsafe_b64encode(tag).rstrip(b"=").decode()
+
+    return f"{header_b64}.{encrypted_key_b64}.{iv_b64}.{ct_b64}.{tag_b64}"
+
+
+def _fetch_adyen_public_key(
+    adyen_token: str,
+    adyen_url: str,
+    gog_base: str,
+    session: requests.Session,
+) -> Optional[str]:
+    """Fetch Adyen public key from securedFields page."""
+    url = f"{adyen_url}/securedfields/{adyen_token}/5.5.1/securedFields.html"
+    params = {
+        "type": "card",
+        "d": base64.b64encode(gog_base.encode()).decode(),
+    }
+    try:
+        resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            return None
+        match = re.search(r'10001\|[A-F0-9]+', resp.text)
+        return match.group() if match else None
+    except Exception as exc:
+        logger.error(f"Failed to fetch Adyen public key: {exc}")
+        return None
+
+
+def _adyen_charge_flow(
+    card_info: Dict,
+    random_person: Dict,
+    gateway_config: Dict,
+) -> Tuple[str, str]:
+    """Full Adyen Charge pipeline: GOG wallet top-up via Adyen CSE.
+
+    Steps:
+        1. Set cookies on session
+        2. Get GOG access token
+        3. Add funds to wallet (create checkout)
+        4. Get cart token
+        5. Get checkout details
+        6. Select payment method (ccard)
+        7. Get payment provider token
+        8. Fetch Adyen public key
+        9. Encrypt card data
+        10. Submit payment
+    """
+    adyen_token = gateway_config.get("adyen_token")
+    if not adyen_token:
+        return ERROR, "Adyen token missing in gateway config"
+
+    adyen_url = gateway_config.get("adyen_url")
+    if not adyen_url:
+        return ERROR, "Adyen URL missing in gateway config"
+
+    gog_base = gateway_config.get("gog_base")
+    gog_api = gateway_config.get("gog_api")
+    if not gog_base or not gog_api:
+        return ERROR, "GOG URLs missing in gateway config"
+
+    cookies_list = gateway_config.get("cookies", [])
+    if not cookies_list:
+        return ERROR, "Cookies missing in gateway config"
+
+    topup = 500  # $5 in cents
+    currency = "USD"
+    locale = "en-US"
+    country_code = "DZ"
+
+    proxies = _proxy_dict(gateway_config)
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_maxsize=5)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    if proxies:
+        session.proxies = proxies
+
+    session.headers.update({
+        "User-Agent": random_person["user_agent"],
+        "Accept": "application/json, text/plain, */*",
+        "Origin": gog_base,
+        "Referer": f"{gog_base}/en/wallet",
+    })
+
+    # Apply cookies
+    for c in cookies_list:
+        name, value = c.get("name"), c.get("value")
+        domain = c.get("domain", ".gog.com")
+        if name and value:
+            session.cookies.set(name, value, domain=domain)
+    session.cookies.set("gog_lc", f"{country_code}_{currency}_{locale}", domain=".gog.com")
+    session.cookies.set("csrf", "true", domain=".gog.com")
+    session.cookies.set("checkout_ab", "new", domain=".gog.com")
+    session.cookies.set("patron_visibility", "visible", domain=".gog.com")
+
+    def _sync_locale():
+        """Read the gog_lc cookie (GOG may overwrite it based on proxy IP geo)
+        and update country_code / currency / locale to match the real order context."""
+        nonlocal country_code, currency, locale
+        gog_lc = session.cookies.get("gog_lc", domain=".gog.com") or ""
+        parts = gog_lc.split("_", 2)
+        if len(parts) == 3:
+            country_code, currency, locale = parts[0], parts[1], parts[2]
+
+    try:
+        # ── Step 1: Get GOG access token ──
+        resp = session.post(f"{gog_api}/user/accessToken.json", timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            return ERROR, "Failed to get GOG access token"
+        _sync_locale()
+        access_token = resp.json().get("accessToken")
+        if not access_token:
+            return ERROR, "GOG access token not found"
+        auth_headers = {"Authorization": f"Bearer {access_token}"}
+
+        # Freeze locale right after Step 1: GOG determined locale from proxy
+        # geo-IP.  Lock it so every subsequent request uses the same context.
+        checkout_country = country_code
+        checkout_currency = currency
+        checkout_locale = locale
+        logger.debug(
+            f"Adyen locale frozen: {checkout_country}_{checkout_currency}_{checkout_locale}"
+        )
+
+        def _force_locale():
+            """Re-apply the frozen gog_lc cookie so GOG Set-Cookie headers can't desync it."""
+            session.cookies.set(
+                "gog_lc",
+                f"{checkout_country}_{checkout_currency}_{checkout_locale}",
+                domain=".gog.com",
+            )
+
+        # ── Step 2: Add funds to wallet ──
+        _force_locale()
+        resp = session.post(
+            f"{gog_base}/wallet/funds",
+            json={"amount": topup, "currency": checkout_currency},
+            headers={"Content-Type": "application/json;charset=UTF-8"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return ERROR, "Failed to add funds to wallet"
+        _force_locale()
+        funds_data = resp.json()
+        redirect_url = funds_data.get("redirectToUrl", "")
+        checkout_id = redirect_url.split("/")[-1] if redirect_url else None
+        if not checkout_id:
+            return ERROR, "Failed to get checkout ID"
+
+        # ── Step 3: Get cart token ──
+        _force_locale()
+        resp = session.get(f"{gog_base}/cartToken.json", timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            return ERROR, "Failed to get cart token"
+        _force_locale()
+        cart_token = resp.json().get("cartToken")
+        if not cart_token:
+            return ERROR, "Cart token not found"
+
+        # ── Step 4: Get checkout details ──
+        _force_locale()
+        params = {
+            "locale": checkout_locale,
+            "countryCode": checkout_country,
+            "currencyCode": checkout_currency,
+            "cartToken": cart_token,
+        }
+        resp = session.get(
+            f"{gog_api}/v1/checkout/{checkout_id}",
+            params=params,
+            headers=auth_headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            logger.error(f"Adyen Step 4: HTTP {resp.status_code} – {resp.text[:200]}")
+            return ERROR, f"Checkout details HTTP {resp.status_code}"
+        checkout_data = resp.json()
+        checksum = checkout_data.get("checksum")
+
+        # ── Step 5: Select payment method ──
+        _force_locale()
+        resp = session.post(
+            f"{gog_api}/v1/checkout/{checkout_id}/payment-method",
+            params={"locale": checkout_locale, "countryCode": checkout_country, "currencyCode": checkout_currency},
+            json={"paymentMethodSlug": "ccard"},
+            headers={**auth_headers, "Content-Type": "application/json"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return ERROR, "Failed to select payment method"
+
+        # ── Step 6: Get payment provider token ──
+        _force_locale()
+        resp = session.post(
+            f"{gog_api}/v1/checkout/{checkout_id}/payment-provider/bt/tokenize",
+            params={"locale": checkout_locale, "countryCode": checkout_country, "currencyCode": checkout_currency},
+            json={},
+            headers={**auth_headers, "Content-Type": "application/json"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return ERROR, "Failed to get payment provider token"
+
+        # ── Step 7: Fetch Adyen public key ──
+        adyen_public_key = _fetch_adyen_public_key(adyen_token, adyen_url, gog_base, session)
+        if not adyen_public_key:
+            return ERROR, "Failed to fetch Adyen public key"
+
+        # ── Step 8: Encrypt card data ──
+        encrypted_card = _adyen_encrypt("number", card_info["number"], adyen_public_key)
+        encrypted_month = _adyen_encrypt("expiryMonth", card_info["month"], adyen_public_key)
+        encrypted_year = _adyen_encrypt("expiryYear", str(card_info["year"]), adyen_public_key)
+        encrypted_cvv = _adyen_encrypt("cvc", card_info["cvv"], adyen_public_key)
+
+        # ── Step 9: Submit payment ──
+        payment_body = {
+            "method": "ccard",
+            "checksum": checksum,
+            "gift": None,
+            "issuer": {"useWalletFunds": False},
+            "details": {
+                "paymentMethod": {
+                    "type": "scheme",
+                    "holderName": "",
+                    "encryptedCardNumber": encrypted_card,
+                    "encryptedExpiryMonth": encrypted_month,
+                    "encryptedExpiryYear": encrypted_year,
+                    "encryptedSecurityCode": encrypted_cvv,
+                }
+            },
+        }
+
+        session.headers["Referer"] = f"{gog_base}/en/checkout/{checkout_id}"
+        _force_locale()
+        resp = session.post(
+            f"{gog_api}/v1/checkout/{checkout_id}/payment",
+            params={"locale": checkout_locale, "countryCode": checkout_country, "currencyCode": checkout_currency},
+            json=payment_body,
+            headers={**auth_headers, "Content-Type": "application/json"},
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        try:
+            result = resp.json()
+        except (json.JSONDecodeError, ValueError):
+            return ERROR, f"Invalid response (HTTP {resp.status_code})"
+
+        rtype = result.get("type", "")
+        if rtype == "success":
+            return CHARGE, "Successfully charged"
+        if rtype == "redirect":
+            return PASSAD, "Challenge Required (3DS)"
+
+        # Error handling
+        error_msg = result.get("message") or result.get("error", {}).get("message", "")
+        if not error_msg:
+            error_msg = (rtype or "Unknown").capitalize()
+
+        lower_msg = error_msg.lower()
+        if "insufficient" in lower_msg or "insufficient_funds" in lower_msg:
+            return INSUFFICIENT_FUNDS, "Insufficient Funds"
+        if "refused" in lower_msg or "declined" in lower_msg:
+            return FAILED, error_msg
+        if "expired" in lower_msg or "invalid" in lower_msg:
+            return FAILED, error_msg
+
+        return FAILED, error_msg
+
+    except requests.RequestException as exc:
+        is_pe, _ = is_proxy_error(exc)
+        if is_pe:
+            msg = categorize_proxy_error(exc)
+            logger.error(f"Proxy error in adyen_charge_flow: {msg}")
+            return ERROR, msg
+        logger.error(f"Request error in adyen_charge_flow: {exc}")
+        return ERROR, f"Request failed: {exc}"
+    except Exception as exc:
+        logger.error(f"Unexpected error in adyen_charge_flow: {exc}")
+        return ERROR, f"Processing failed: {exc}"
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════
@@ -802,6 +1551,10 @@ def generate_payload_payment(
     if "Stripe Charge" in gw_type:
         return _generate_stripe_charge_payload(gateway_config, card_info, random_person, secrets)
 
+    # ── Adyen Charge ──────────────────────────────
+    if "Adyen Charge" in gw_type:
+        return True, "adyen_charge_flow", None
+
     logger.error(f"Unsupported gateway type: {gw_type}")
     return False, f"Unsupported gateway type: {gw_type}", None
 
@@ -959,6 +1712,10 @@ def _generate_stripe_auth_payload(
             "_ajax_nonce": ajax_nonce,
         }
         return True, payload, None
+
+    if "v3_with_login" in version:
+        # Login-based flow handles its own session and returns status directly
+        return True, "v3_login_flow", None
 
     return False, f"Unsupported Stripe Auth version: {version}", None
 
@@ -1237,6 +1994,15 @@ def process_payment(
     """Orchestrate the full payment flow: payload → submit → parse response."""
     card_number = card_info["number"]
 
+    # Self-contained flows: skip extract_payment_config (they manage their own sessions)
+    gw_type = gateway_config.get("gateway_type", "")
+    if "Adyen Charge" in gw_type:
+        try:
+            status, message = _adyen_charge_flow(card_info, random_person, gateway_config)
+            return status, message
+        finally:
+            session_manager.cleanup_session(request_id)
+
     logger.info(f"🔧 [{request_id}] Generating payment payload...")
     t0 = time.time()
     ok, result, info = generate_payload_payment(
@@ -1250,6 +2016,12 @@ def process_payment(
     payload = result
 
     try:
+        # v3_with_login: self-contained login flow
+        if payload == "v3_login_flow":
+            status, message = _stripe_auth_login_flow(card_info, random_person, gateway_config)
+            session_manager.cleanup_session(request_id)
+            return status, message
+
         if "Stripe Charge" in gateway_config["gateway_type"] and "v1_without_cookies" in gateway_config.get("version", ""):
             response = confirm_payment_intent(payload, info, random_person, gateway_config)
         else:
