@@ -1,7 +1,8 @@
-Flask
 requests
-urllib3
+flask
 lxml
-Faker
+faker
 cloudscraper
+cryptography
+urllib3
 gunicorn
